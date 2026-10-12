@@ -1,0 +1,29 @@
+J48 pruned tree
+------------------
+
+petalwidth <= 0.6: Iris-setosa (50.0)
+petalwidth > 0.6
+|   petalwidth <= 1.7
+|   |   petallength <= 4.9: Iris-versicolor (48.0/1.0)
+|   |   petallength > 4.9
+|   |   |   petalwidth <= 1.5: Iris-virginica (3.0)
+|   |   |   petalwidth > 1.5: Iris-versicolor (3.0/1.0)
+|   petalwidth > 1.7: Iris-virginica (46.0/1.0)
+
+Number of Leaves  : 	5
+Size of the tree : 	9
+
+=== Stratified cross-validation ===
+=== Summary ===
+
+Correctly Classified Instances         144               96      %
+Incorrectly Classified Instances         6                4      %
+Kappa statistic                          0.94
+Total Number of Instances              150
+
+=== Confusion Matrix ===
+
+  a  b  c   <-- classified as
+ 49  1  0 |  a = Iris-setosa
+  0 47  3 |  b = Iris-versicolor
+  0  2 48 |  c = Iris-virginica
