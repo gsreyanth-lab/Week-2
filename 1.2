@@ -1,0 +1,308 @@
+/*
+ * weka_classify_cluster.c
+ * Classification (C4.5/J48-style decision tree + 10-fold CV)
+ * and Clustering (K-Means, k=3) on iris, in plain C.
+ *
+ * Compile: gcc -O2 -o weka_cc weka_classify_cluster.c -lm
+ * Run    : ./weka_cc iris.csv
+ * CSV format: sepallength,sepalwidth,petallength,petalwidth,class
+ */
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <math.h>
+#include <float.h>
+
+#define MAXN 1000
+#define NA   4
+#define NC   3
+static double X[MAXN][NA];
+static int    Y[MAXN];
+static int    n = 0;
+static const char *attr_name[NA]  = {"sepallength","sepalwidth","petallength","petalwidth"};
+static char   cname[NC][32];
+static int    ncls = 0;
+
+/* ------------------------------ data loading ------------------------------ */
+static int class_id(const char *s) {
+    for (int i = 0; i < ncls; i++) if (!strcmp(cname[i], s)) return i;
+    strcpy(cname[ncls], s);
+    return ncls++;
+}
+static int load_csv(const char *path) {
+    FILE *f = fopen(path, "r");
+    if (!f) return 0;
+    char line[256];
+    while (fgets(line, sizeof line, f) && n < MAXN) {
+        char lab[64];
+        if (sscanf(line, "%lf,%lf,%lf,%lf,%63[^\r\n]",
+                   &X[n][0], &X[n][1], &X[n][2], &X[n][3], lab) == 5)
+            Y[n++] = class_id(lab);
+    }
+    fclose(f);
+    return n;
+}
+
+/* =========================== PART 1: DECISION TREE ======================== */
+typedef struct Node {
+    int leaf, cls, attr;
+    double thr;
+    double weight, errors;
+    struct Node *lo, *hi;
+} Node;
+
+static double entropy(const int *cnt, int total) {
+    double e = 0;
+    if (!total) return 0;
+    for (int c = 0; c < ncls; c++)
+        if (cnt[c]) { double p = (double)cnt[c] / total; e -= p * log2(p); }
+    return e;
+}
+
+static int g_attr;
+static int cmp_attr(const void *a, const void *b) {
+    double x = X[*(const int *)a][g_attr], y = X[*(const int *)b][g_attr];
+    return (x > y) - (x < y);
+}
+
+#define MIN_LEAF 2   /* like J48 -M 2 */
+
+static Node *build(int *idx, int m) {
+    Node *nd = calloc(1, sizeof(Node));
+    int cnt[NC] = {0};
+    for (int i = 0; i < m; i++) cnt[Y[idx[i]]]++;
+    int best = 0;
+    for (int c = 1; c < ncls; c++) if (cnt[c] > cnt[best]) best = c;
+    nd->cls = best; nd->weight = m; nd->errors = m - cnt[best];
+
+    if (cnt[best] == m || m < 2 * MIN_LEAF) { nd->leaf = 1; return nd; }
+
+    double base = entropy(cnt, m), best_ratio = 0;
+    int best_attr = -1; double best_thr = 0;
+
+    for (int a = 0; a < NA; a++) {
+        g_attr = a;
+        qsort(idx, m, sizeof(int), cmp_attr);
+        int left[NC] = {0};
+        for (int i = 0; i < m - 1; i++) {
+            left[Y[idx[i]]]++;
+            double v1 = X[idx[i]][a], v2 = X[idx[i + 1]][a];
+            if (v1 == v2) continue;
+            int nl = i + 1, nr = m - nl;
+            if (nl < MIN_LEAF || nr < MIN_LEAF) continue;
+            int right[NC];
+            for (int c = 0; c < ncls; c++) right[c] = cnt[c] - left[c];
+            double gain = base - ((double)nl / m) * entropy(left, nl)
+                               - ((double)nr / m) * entropy(right, nr);
+            double pl = (double)nl / m, pr = (double)nr / m;
+            double split_info = -(pl * log2(pl) + pr * log2(pr));
+            double ratio = gain / split_info;
+            if (ratio > best_ratio + 1e-12) {
+                best_ratio = ratio; best_attr = a; best_thr = (v1 + v2) / 2;
+            }
+        }
+    }
+    if (best_attr < 0) { nd->leaf = 1; return nd; }
+
+    /* partition */
+    int *lo = malloc(m * sizeof(int)), *hi = malloc(m * sizeof(int));
+    int nl = 0, nh = 0;
+    for (int i = 0; i < m; i++) {
+        if (X[idx[i]][best_attr] <= best_thr) lo[nl++] = idx[i];
+        else                                  hi[nh++] = idx[i];
+    }
+    nd->attr = best_attr; nd->thr = best_thr;
+    nd->lo = build(lo, nl);
+    nd->hi = build(hi, nh);
+    free(lo); free(hi);
+    return nd;
+}
+
+/* simple pessimistic-style pruning: collapse a subtree if it does not
+ * reduce training errors compared with a single leaf (+ small penalty) */
+static double subtree_errors(Node *nd) {
+    return nd->leaf ? nd->errors : subtree_errors(nd->lo) + subtree_errors(nd->hi);
+}
+static void prune(Node *nd) {
+    if (nd->leaf) return;
+    prune(nd->lo); prune(nd->hi);
+    double sub = subtree_errors(nd);
+    if (nd->errors <= sub + 0.5) nd->leaf = 1;   /* leaf is as good -> prune */
+}
+
+static int leaves(Node *nd) { return nd->leaf ? 1 : leaves(nd->lo) + leaves(nd->hi); }
+static int size(Node *nd)   { return nd->leaf ? 1 : 1 + size(nd->lo) + size(nd->hi); }
+
+static void print_tree(Node *nd, int depth) {
+    if (nd->leaf) return;
+    for (int side = 0; side < 2; side++) {
+        Node *ch = side ? nd->hi : nd->lo;
+        for (int d = 0; d < depth; d++) printf("|   ");
+        printf("%s %s %.4g", attr_name[nd->attr], side ? ">" : "<=", nd->thr);
+        if (ch->leaf) {
+            if (ch->errors > 0) printf(": %s (%.1f/%.1f)\n", cname[ch->cls], ch->weight, ch->errors);
+            else                printf(": %s (%.1f)\n", cname[ch->cls], ch->weight);
+        } else {
+            printf("\n");
+            print_tree(ch, depth + 1);
+        }
+    }
+}
+
+static int predict(Node *nd, const double *x) {
+    while (!nd->leaf) nd = (x[nd->attr] <= nd->thr) ? nd->lo : nd->hi;
+    return nd->cls;
+}
+static void free_tree(Node *nd) {
+    if (!nd) return;
+    free_tree(nd->lo); free_tree(nd->hi); free(nd);
+}
+
+static void classification_demo(void) {
+    printf("=============== CLASSIFICATION: decision tree (C4.5-style) ===============\n\n");
+
+    /* full-data tree */
+    int *idx = malloc(n * sizeof(int));
+    for (int i = 0; i < n; i++) idx[i] = i;
+    Node *root = build(idx, n);
+    prune(root);
+    printf("Decision tree (pruned)\n----------------------\n\n");
+    print_tree(root, 0);
+    printf("\nNumber of Leaves  : \t%d\nSize of the tree : \t%d\n\n", leaves(root), size(root));
+    free_tree(root);
+
+    /* stratified 10-fold CV */
+    srand(1);
+    int *perm = malloc(n * sizeof(int)), *fold = malloc(n * sizeof(int));
+    for (int i = 0; i < n; i++) perm[i] = i;
+    for (int i = n - 1; i > 0; i--) { int j = rand() % (i + 1); int t = perm[i]; perm[i] = perm[j]; perm[j] = t; }
+    int pos = 0;
+    for (int c = 0; c < ncls; c++)
+        for (int i = 0; i < n; i++) if (Y[perm[i]] == c) fold[perm[i]] = (pos++) % 10;
+
+    int cm[NC][NC] = {{0}};
+    for (int k = 0; k < 10; k++) {
+        int *train = malloc(n * sizeof(int)), nt = 0;
+        for (int i = 0; i < n; i++) if (fold[i] != k) train[nt++] = i;
+        Node *t = build(train, nt);
+        prune(t);
+        for (int i = 0; i < n; i++) if (fold[i] == k) cm[Y[i]][predict(t, X[i])]++;
+        free_tree(t); free(train);
+    }
+    int ok = 0;
+    for (int c = 0; c < ncls; c++) ok += cm[c][c];
+    double po = (double)ok / n, pe = 0;
+    for (int c = 0; c < ncls; c++) {
+        int row = 0, col = 0;
+        for (int d = 0; d < ncls; d++) { row += cm[c][d]; col += cm[d][c]; }
+        pe += ((double)row / n) * ((double)col / n);
+    }
+    printf("=== Stratified 10-fold cross-validation ===\n\n");
+    printf("Correctly Classified Instances      %4d    %8.4f %%\n", ok, 100 * po);
+    printf("Incorrectly Classified Instances    %4d    %8.4f %%\n", n - ok, 100 * (1 - po));
+    printf("Kappa statistic                     %8.4f\n", (po - pe) / (1 - pe));
+    printf("Total Number of Instances           %4d\n\n", n);
+    printf("=== Confusion Matrix ===\n\n   a   b   c   <-- classified as\n");
+    for (int c = 0; c < ncls; c++) {
+        for (int d = 0; d < ncls; d++) printf("%4d", cm[c][d]);
+        printf(" |  %c = %s\n", 'a' + c, cname[c]);
+    }
+    free(idx); free(perm); free(fold);
+}
+
+/* ============================ PART 2: K-MEANS ============================= */
+#define K 3
+static double dist2(const double *a, const double *b) {
+    double s = 0;
+    for (int j = 0; j < NA; j++) s += (a[j] - b[j]) * (a[j] - b[j]);
+    return s;
+}
+
+static double kmeans(int seed, double cen[K][NA], int *assign, int *iters) {
+    srand(seed);
+    int chosen[K];
+    for (int c = 0; c < K; c++) {          /* pick K distinct random instances */
+        int ok;
+        do {
+            chosen[c] = rand() % n; ok = 1;
+            for (int p = 0; p < c; p++) if (chosen[p] == chosen[c]) ok = 0;
+        } while (!ok);
+        memcpy(cen[c], X[chosen[c]], sizeof(double) * NA);
+    }
+    for (int i = 0; i < n; i++) assign[i] = -1;
+    int changed = 1; *iters = 0;
+    while (changed && *iters < 500) {
+        changed = 0; (*iters)++;
+        for (int i = 0; i < n; i++) {
+            int b = 0; double bd = DBL_MAX;
+            for (int c = 0; c < K; c++) { double d = dist2(X[i], cen[c]); if (d < bd) { bd = d; b = c; } }
+            if (assign[i] != b) { assign[i] = b; changed = 1; }
+        }
+        double sum[K][NA] = {{0}}; int cnt[K] = {0};
+        for (int i = 0; i < n; i++) { cnt[assign[i]]++; for (int j = 0; j < NA; j++) sum[assign[i]][j] += X[i][j]; }
+        for (int c = 0; c < K; c++) if (cnt[c]) for (int j = 0; j < NA; j++) cen[c][j] = sum[c][j] / cnt[c];
+    }
+    double sse = 0;
+    for (int i = 0; i < n; i++) sse += dist2(X[i], cen[assign[i]]);
+    return sse;
+}
+
+static void clustering_demo(void) {
+    printf("\n\n================== CLUSTERING: K-Means (k = 3) ==================\n\n");
+    double best_cen[K][NA], cen[K][NA];
+    int best_asg[MAXN], asg[MAXN], iters, best_iters = 0;
+    double best_sse = DBL_MAX;
+    for (int seed = 1; seed <= 10; seed++) {           /* 10 restarts, keep best SSE */
+        double sse = kmeans(seed, cen, asg, &iters);
+        if (sse < best_sse) { best_sse = sse; best_iters = iters; memcpy(best_cen, cen, sizeof cen); memcpy(best_asg, asg, sizeof asg); }
+    }
+    int size_c[K] = {0}, tab[NC][K] = {{0}};
+    for (int i = 0; i < n; i++) { size_c[best_asg[i]]++; tab[Y[i]][best_asg[i]]++; }
+
+    /* classes-to-clusters: try all 3! mappings, keep the best */
+    int perms[6][3] = {{0,1,2},{0,2,1},{1,0,2},{1,2,0},{2,0,1},{2,1,0}};
+    int bp = 0, bm = -1;
+    for (int p = 0; p < 6; p++) {
+        int m = 0;
+        for (int c = 0; c < NC; c++) m += tab[c][perms[p][c]];
+        if (m > bm) { bm = m; bp = p; }
+    }
+    /* renumber clusters so cluster c <-- class c (easier to read) */
+    int remap[K];
+    for (int c = 0; c < NC; c++) remap[perms[bp][c]] = c;
+
+    printf("kMeans\n======\n\nNumber of iterations: %d\n", best_iters);
+    printf("Within cluster sum of squared errors: %.4f\n\n", best_sse);
+    printf("Final cluster centroids:\n");
+    printf("%-14s%10s%10s%10s\n", "Attribute", "Cluster0", "Cluster1", "Cluster2");
+    printf("-------------------------------------------------\n");
+    for (int j = 0; j < NA; j++) {
+        printf("%-14s", attr_name[j]);
+        for (int c = 0; c < K; c++) {
+            int orig = perms[bp][c];
+            printf("%10.4f", best_cen[orig][j]);
+        }
+        printf("\n");
+    }
+    printf("\nClustered Instances\n\n");
+    for (int c = 0; c < K; c++) printf("%d  %6d ( %2.0f%%)\n", c, size_c[perms[bp][c]], 100.0 * size_c[perms[bp][c]] / n);
+
+    printf("\nClasses to Clusters:\n\n    0    1    2   <-- assigned to cluster\n");
+    for (int c = 0; c < NC; c++) {
+        for (int k = 0; k < K; k++) printf("%5d", tab[c][perms[bp][k]]);
+        printf(" | %s\n", cname[c]);
+    }
+    printf("\n");
+    for (int c = 0; c < NC; c++) printf("Cluster %d <-- %s\n", c, cname[c]);
+    printf("\nIncorrectly clustered instances :\t%d\t%.4f %%\n", n - bm, 100.0 * (n - bm) / n);
+    (void)remap;
+}
+
+int main(int argc, char **argv) {
+    const char *path = argc > 1 ? argv[1] : "iris.csv";
+    if (!load_csv(path)) { fprintf(stderr, "Cannot read %s\n", path); return 1; }
+    printf("Loaded %d instances, %d attributes + class (%d classes)\n\n", n, NA, ncls);
+    classification_demo();
+    clustering_demo();
+    return 0;
+}
