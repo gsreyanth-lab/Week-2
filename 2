@@ -1,0 +1,35 @@
+import weka.core.Instances;
+import weka.core.converters.ConverterUtils.DataSource;
+import weka.clusterers.SimpleKMeans;
+import weka.clusterers.ClusterEvaluation;
+import weka.filters.Filter;
+import weka.filters.unsupervised.attribute.Remove;
+
+public class KMeansDemo {
+    public static void main(String[] args) throws Exception {
+        Instances data = new DataSource("data/iris.arff").getDataSet();
+
+        // Remove the class attribute (clustering is unsupervised)
+        Remove remove = new Remove();
+        remove.setAttributeIndices("last");
+        remove.setInputFormat(data);
+        Instances noClass = Filter.useFilter(data, remove);
+
+        // Build clusterer
+        SimpleKMeans km = new SimpleKMeans();
+        km.setNumClusters(3);
+        km.setSeed(10);
+        km.buildClusterer(noClass);
+        System.out.println(km);
+
+        // Evaluate
+        ClusterEvaluation eval = new ClusterEvaluation();
+        eval.setClusterer(km);
+        eval.evaluateClusterer(noClass);
+        System.out.println(eval.clusterResultsToString());
+
+        // Cluster assignment of the first 5 instances
+        for (int i = 0; i < 5; i++)
+            System.out.println("Instance " + i + " -> Cluster " + km.clusterInstance(noClass.instance(i)));
+    }
+}
