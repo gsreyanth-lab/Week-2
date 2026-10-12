@@ -1,0 +1,27 @@
+import weka.core.Instances;
+import weka.core.converters.ConverterUtils.DataSource;
+import weka.classifiers.trees.J48;
+import weka.classifiers.Evaluation;
+import java.util.Random;
+
+public class J48Demo {
+    public static void main(String[] args) throws Exception {
+        // Load dataset
+        Instances data = new DataSource("data/iris.arff").getDataSet();
+        data.setClassIndex(data.numAttributes() - 1);   // last attribute = class
+
+        // Build classifier
+        J48 tree = new J48();
+        tree.setConfidenceFactor(0.25f);                 // default pruning
+        tree.buildClassifier(data);
+        System.out.println(tree);
+
+        // 10-fold cross-validation
+        Evaluation eval = new Evaluation(data);
+        eval.crossValidateModel(new J48(), data, 10, new Random(1));
+
+        System.out.println(eval.toSummaryString("\n=== Summary ===\n", false));
+        System.out.println(eval.toClassDetailsString());
+        System.out.println(eval.toMatrixString());
+    }
+}
